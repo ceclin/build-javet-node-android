@@ -1,0 +1,145 @@
+--- node-ref/android_configure.py	2022-12-01 13:20:44.838121296 +0000
++++ node/android_configure.py	2022-12-02 06:07:32.607692996 +0000
+@@ -1,6 +1,7 @@
+ import platform
+ import sys
+ import os
++import shutil
+ 
+ # TODO: In next version, it will be a JSON file listing all the patches, and then it will iterate through to apply them.
+ def patch_android():
+@@ -66,11 +67,15 @@
+ os.environ['CC'] = toolchain_path + "/bin/" + TOOLCHAIN_PREFIX + android_sdk_version + "-" +  "clang"
+ os.environ['CXX'] = toolchain_path + "/bin/" + TOOLCHAIN_PREFIX + android_sdk_version + "-" + "clang++"
+ 
++os.environ['CC_host'] = shutil.which("gcc")
++os.environ['CXX_host'] = shutil.which("g++")
++
+ GYP_DEFINES = "target_arch=" + arch
+-GYP_DEFINES += " v8_target_arch=" + arch
++GYP_DEFINES += " v8_target_arch=" + DEST_CPU
+ GYP_DEFINES += " android_target_arch=" + arch
+ GYP_DEFINES += " host_os=" + host_os + " OS=android"
+ os.environ['GYP_DEFINES'] = GYP_DEFINES
+ 
+ if os.path.exists("./configure"):
+-    os.system("./configure --dest-cpu=" + DEST_CPU + " --dest-os=android --openssl-no-asm --cross-compiling")
++    extra_arguments = " --enable-static --with-intl=none --without-dtrace --without-etw --without-npm --without-corepack"
++    os.system("./configure --dest-cpu=" + DEST_CPU + " --dest-os=android --openssl-no-asm --cross-compiling" + extra_arguments)
+--- node-ref/common.gypi	2022-12-01 13:20:44.768120497 +0000
++++ node/common.gypi	2022-12-01 13:21:15.529851498 +0000
+@@ -408,7 +408,7 @@
+         'ldflags': [ '-rdynamic' ],
+         'target_conditions': [
+           # The 1990s toolchain on SmartOS can't handle thin archives.
+-          ['_type=="static_library" and OS=="solaris"', {
++          ['_type=="static_library" and OS in "solaris android"', {
+             'standalone_static_library': 1,
+           }],
+           ['OS=="openbsd"', {
+--- node-ref/configure.py	2022-12-01 13:20:45.448128256 +0000
++++ node/configure.py	2022-12-01 13:21:15.529851498 +0000
+@@ -1246,8 +1246,8 @@
+   o['variables']['want_separate_host_toolset'] = int(cross_compiling)
+ 
+   # Enable branch protection for arm64
+-  if target_arch == 'arm64':
+-    o['cflags']+=['-msign-return-address=all']
++  # if target_arch == 'arm64':
++  #   o['cflags']+=['-msign-return-address=all']
+ 
+   if options.node_snapshot_main is not None:
+     if options.shared:
+--- node-ref/deps/v8/src/codegen/arm/constants-arm.h	2022-12-01 13:20:43.258103267 +0000
++++ node/deps/v8/src/codegen/arm/constants-arm.h	2022-12-01 19:20:21.813175203 +0000
+@@ -160,7 +160,13 @@
+   U = 1 << 23,  // Positive (or negative) offset/index.
+   P = 1 << 24,  // Offset/pre-indexed addressing (or post-indexed addressing).
+   I = 1 << 25,  // Immediate shifter operand (or not).
++#ifdef B0
++#undef B0
++// ensure safe undef
++#define B0 ~!@#$%^&*()_+{}|:"<>?`-=[]\;',./
++#else
+   B0 = 1 << 0,
++#endif
+   B4 = 1 << 4,
+   B5 = 1 << 5,
+   B6 = 1 << 6,
+--- node-ref/deps/v8/src/heap/base/asm/x64/push_registers_asm.cc	2022-12-01 13:20:43.238103039 +0000
++++ node/deps/v8/src/heap/base/asm/x64/push_registers_asm.cc	2022-12-01 15:42:14.156089798 +0000
+@@ -16,12 +16,15 @@
+ // GN toolchain (e.g. ChromeOS) and not provide them.
+ // _WIN64 Defined as 1 when the compilation target is 64-bit ARM or x64.
+ // Otherwise, undefined.
++
++#if defined(V8_TARGET_ARCH_ARM64) || defined(V8_TARGET_ARCH_X64)
+ #ifdef _WIN64
+ 
+ // We maintain 16-byte alignment at calls. There is an 8-byte return address
+ // on the stack and we push 232 bytes which maintains 16-byte stack alignment
+ // at the call.
+ // Source: https://docs.microsoft.com/en-us/cpp/build/x64-calling-convention
++
+ asm(".globl PushAllRegistersAndIterateStack             \n"
+     "PushAllRegistersAndIterateStack:                   \n"
+     // rbp is callee-saved. Maintain proper frame pointer for debugging.
+@@ -104,3 +107,39 @@
+     "  ret                                              \n");
+ 
+ #endif  // !_WIN64
++#else
++asm(
++#ifdef _WIN32
++    ".globl _PushAllRegistersAndIterateStack            \n"
++    "_PushAllRegistersAndIterateStack:                  \n"
++#else   // !_WIN32
++    ".globl PushAllRegistersAndIterateStack             \n"
++    ".type PushAllRegistersAndIterateStack, %function   \n"
++    ".hidden PushAllRegistersAndIterateStack            \n"
++    "PushAllRegistersAndIterateStack:                   \n"
++#endif  // !_WIN32
++    // [ IterateStackCallback ]
++    // [ StackVisitor*        ]
++    // [ Stack*               ]
++    // [ ret                  ]
++    // ebp is callee-saved. Maintain proper frame pointer for debugging.
++    "  push %ebp                                        \n"
++    "  movl %esp, %ebp                                  \n"
++    "  push %ebx                                        \n"
++    "  push %esi                                        \n"
++    "  push %edi                                        \n"
++    // Save 3rd parameter (IterateStackCallback).
++    "  movl 28(%esp), %ecx                              \n"
++    // Pass 3rd parameter as esp (stack pointer).
++    "  push %esp                                        \n"
++    // Pass 2nd parameter (StackVisitor*).
++    "  push 28(%esp)                                    \n"
++    // Pass 1st parameter (Stack*).
++    "  push 28(%esp)                                    \n"
++    "  call *%ecx                                       \n"
++    // Pop the callee-saved registers.
++    "  addl $24, %esp                                   \n"
++    // Restore rbp as it was used as frame pointer.
++    "  pop %ebp                                         \n"
++    "  ret                                              \n");
++#endif
+--- node-ref/test/cctest/test_crypto_clienthello.cc	2022-12-01 13:20:44.988123007 +0000
++++ node/test/cctest/test_crypto_clienthello.cc	2022-12-01 13:21:15.529851498 +0000
+@@ -18,6 +18,7 @@
+ #ifdef __linux__
+ #include <sys/mman.h>
+ #include <unistd.h>
++#include <malloc.h>
+ #if defined(_SC_PAGE_SIZE) && defined(PROT_NONE) && defined(PROT_READ) &&      \
+     defined(PROT_WRITE)
+ #define USE_MPROTECT
+@@ -54,7 +55,7 @@
+ #ifdef USE_MPROTECT
+     // Place the packet right before a guard page, which, when accessed, causes
+     // a segmentation fault.
+-    alloc_base = static_cast<uint8_t*>(aligned_alloc(page, 2 * page));
++    alloc_base = static_cast<uint8_t*>(memalign(page, 2 * page));
+     EXPECT_NE(alloc_base, nullptr);
+     uint8_t* second_page = alloc_base + page;
+     EXPECT_EQ(mprotect(second_page, page, PROT_NONE), 0);

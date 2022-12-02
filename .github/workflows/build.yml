@@ -1,0 +1,57 @@
+name: Build
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - synchronize
+      - reopened
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, arm, x86_64, x86]
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup docker buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build builder image
+        uses: docker/build-push-action@v3
+        with:
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          file: Dockerfile.prod
+          tags: ceclin/builder:latest
+
+      - name: Run builder image
+        run: |
+          mkdir out && docker run --name builder \
+            -v ${{ github.workspace }}/out:/abc/out \
+            ceclin/builder:latest ./build.sh ${{ matrix.arch }}
+
+      - name: Upload log
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-log
+          path: out/log
+
+      - name: Upload lib
+        uses: actions/upload-artifact@v3
+        with:
+          name: native-lib
+          path: out/lib
+
+      - name: Check build status
+        run: |
+          if [ ! $(ls -A out/lib/*) ]; then
+            echo "::error::Build failed"
+            exit 1
+          fi
